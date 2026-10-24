@@ -1,0 +1,7 @@
+# 组件依赖
+# 说明：
+#  - esp-sr 使用 AFE 接口（esp_afe_sr_iface.h 等），1.9.x 与 IDF >=5.0 兼容（本工程 IDF v5.3.5）
+#  - 不要引入 esp-sr 的统一 esp_sr.h API（那是 esp-sr 2.x 未发布分支的接口，1.x 无此头文件）
+dependencies:
+  idf: ">=5.0"
+  espressif/esp-sr: "^1.5.0"

@@ -1,0 +1,8 @@
+# 上位机依赖（Python 3.10+）
+pyside6>=6.6            # GUI
+openai>=1.30            # GLM / Qwen 均走 OpenAI 兼容接口
+faster-whisper>=1.0     # 本地 STT（依赖 ctranslate2）
+piper-tts>=1.2          # 本地 TTS
+onnxruntime>=1.17       # piper 依赖
+numpy>=1.26
+sounddevice>=0.4        # 本地调试录音/回放（可选）

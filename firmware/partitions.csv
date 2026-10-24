@@ -1,0 +1,15 @@
+# 16MB flash 分区表（实测芯片 flash = 16384KB）
+#
+# 关键约束：
+#   1) model 分区必须 >= build/srmodels/srmodels.bin 的体积，否则 esp-sr mmap
+#      只能映射到部分模型数据，wakenet 句柄解析会拿到越界/无效指针。
+#   2) 分区偏移必须按顺序无重叠，改动后必须 `idf.py erase-flash` 再整片烧录。
+#
+# Name,   Type, SubType, Offset,   Size,     Flags
+nvs,      data, nvs,      0x9000,   0x6000,
+phy_init, data, phy,      0xf000,   0x1000,
+factory,  app,  factory,  0x10000,  0x300000,
+model,    data, spiffs,   0x310000, 0x400000,
+ota_0,    app,  ota_0,    0x710000, 0x300000,
+ota_1,    app,  ota_1,    0xA10000, 0x300000,
+nvs_key,  data, nvs_keys, 0xD10000, 0x1000,

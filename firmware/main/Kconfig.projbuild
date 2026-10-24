@@ -1,0 +1,137 @@
+# 本文件位于 main 组件目录，随项目 Kconfig 自动合并，idf.py menuconfig 可见
+menu "Voice Wake System"
+
+    # ===== 音频参数 =====
+    config VW_SAMPLE_RATE
+        int "采样率 (Hz)"
+        default 16000
+
+    config VW_FRAME_MS
+        int "分帧时长 (ms)"
+        default 20
+
+    config VW_DEFAULT_VOLUME
+        int "默认音量 (0-100)"
+        default 60
+
+    # ===== I2S 硬件引脚（按板型核对）=====
+    config VW_MIC_BCLK_GPIO
+        int "麦克风 BCLK(SCK) GPIO"
+        default 5
+
+    config VW_MIC_WS_GPIO
+        int "麦克风 WS(LRCLK) GPIO"
+        default 4
+
+    config VW_MIC_DIN_GPIO
+        int "麦克风 SD(DIN) GPIO"
+        default 6
+
+    choice VW_MIC_SLOT
+        prompt "INMP441 L/R 声道"
+        default VW_MIC_SLOT_AUTO
+        help
+            INMP441 的 L/R 脚电平决定数据落在 I2S 帧的左槽还是右槽：
+              L/R 接地 → 左声道
+              L/R 接 VDD → 右声道
+            读错槽时读到的是悬空线的时钟串扰（数值恒为 ±21845/±21846 一类），
+            表现为“有电平但唤醒永远不触发”。
+
+        config VW_MIC_SLOT_AUTO
+            bool "自动检测（推荐）"
+            help
+                上电各采 32ms，根据“等幅反号比例/RMS”判断哪个声道是真实数据，
+                必要时自动换槽并打印 `已自动切换到 x 声道`。两个声道都像串扰时会
+                报错提示检查供电/接线。
+
+        config VW_MIC_SLOT_LEFT
+            bool "强制左声道 (L/R 接地)"
+
+        config VW_MIC_SLOT_RIGHT
+            bool "强制右声道 (L/R 接 VDD)"
+    endchoice
+
+    config VW_AMP_BCLK_GPIO
+        int "功放 BCLK GPIO"
+        default 16
+
+    config VW_AMP_LRC_GPIO
+        int "功放 LRC(WS) GPIO"
+        default 15
+
+    config VW_AMP_DOUT_GPIO
+        int "功放 DIN(DOUT) GPIO"
+        default 7
+
+    # ===== ESP-SR 唤醒引擎 =====
+    config VW_SR_MODEL_PARTITION
+        string "模型分区标签 (esp-sr srmodels)"
+        default "model"
+        help
+            必须与 partitions.csv 中的分区名一致。esp-sr 运行时会 mmap 该分区读取
+            唤醒模型，因此必须用 `idf.py flash`（而非 app-flash）烧录 srmodels.bin，
+            且分区体积要大于等于 build/srmodels/srmodels.bin。
+
+    config VW_SR_WAKENET_NAME
+        string "唤醒词模型名"
+        default "wn9_hilexin"
+        help
+            例：wn9_hilexin（Hi 乐鑫）、wn9_nihaoxiaozhi_tts（你好小智）。
+            运行时会先校验该名字是否存在于模型分区，不存在则回退到分区内第一个 wn* 模型，
+            并在日志中打印全部可用模型，避免因名字不匹配直接崩溃。
+
+    choice VW_AFE_MODE
+        prompt "AFE 运行模式"
+        default VW_AFE_MODE_HIGH_PERF
+        help
+            HIGH_PERF 使用 AEC3 全带宽回声消除，效果最好但占 PSRAM；
+            LOW_COST 使用轻量 AEC，适合内存紧张或无需强回声消除的场景。
+
+        config VW_AFE_MODE_HIGH_PERF
+            bool "高性能（需要 PSRAM）"
+
+        config VW_AFE_MODE_LOW_COST
+            bool "低开销"
+    endchoice
+
+    choice VW_AFE_MEM
+        prompt "AFE 内存分配策略"
+        default VW_AFE_MEM_BALANCE
+
+        config VW_AFE_MEM_MORE_INTERNAL
+            bool "优先内部 RAM"
+
+        config VW_AFE_MEM_BALANCE
+            bool "内部 RAM + PSRAM 均衡"
+
+        config VW_AFE_MEM_MORE_PSRAM
+            bool "优先 PSRAM"
+    endchoice
+
+    # ===== 通信参数 =====
+    config VW_TCP_PORT
+        int "上位机 TCP 监听端口"
+        default 8888
+
+    config VW_HEARTBEAT_PERIOD_S
+        int "心跳周期 (秒)"
+        default 3
+
+    config VW_HEARTBEAT_TIMEOUT_S
+        int "心跳超时 (秒)"
+        default 12
+
+    # ===== 出厂默认（NVS 为空时使用；正式 WiFi/IP 建议由上位机下发）=====
+    config VW_DEFAULT_WIFI_SSID
+        string "默认 WiFi SSID"
+        default ""
+
+    config VW_DEFAULT_WIFI_PASS
+        string "默认 WiFi 密码"
+        default ""
+
+    config VW_DEFAULT_HOST_IP
+        string "默认上位机 IP"
+        default ""
+
+endmenu
