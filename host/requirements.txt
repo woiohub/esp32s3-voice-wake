@@ -6,3 +6,4 @@ piper-tts>=1.2          # 本地 TTS
 onnxruntime>=1.17       # piper 依赖
 numpy>=1.26
 sounddevice>=0.4        # 本地调试录音/回放（可选）
+bleak>=0.21             # 蓝牙（BLE）配网：Windows 需蓝牙适配器

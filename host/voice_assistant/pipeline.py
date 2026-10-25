@@ -109,7 +109,17 @@ class Pipeline:
         cmd = msg.get("cmd", "")
         if cmd == "hello":
             self.device_info = msg.get("params", {})
-            self._notify(f"设备上线: {json.dumps(self.device_info, ensure_ascii=False)}")
+            first = not getattr(self, "_hello_seen", False)
+            self._hello_seen = True
+            if first:
+                self._notify(f"设备上线: {json.dumps(self.device_info, ensure_ascii=False)}")
+            else:
+                # 参数变更后设备会补发一次 hello（见固件 send_hello），
+                # 日志里和"上线"区分开，避免每次调音量都误报"设备上线"。
+                self._notify("设备信息已同步：volume=%s wake=%s ack=%s" % (
+                    self.device_info.get("volume", "?"),
+                    self.device_info.get("wake_enable", "?"),
+                    self.device_info.get("ack_enable", "?")))
             if self.on_device:
                 self.on_device(self.device_info)
         elif cmd in ("session.start", "session.end"):

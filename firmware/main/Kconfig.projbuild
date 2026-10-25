@@ -121,6 +121,41 @@ menu "Voice Wake System"
         int "心跳超时 (秒)"
         default 12
 
+    # ===== 蓝牙配网 =====
+    config VW_PROV_ENABLE
+        bool "启用蓝牙配网（WiFi 连不上时的兜底）"
+        default y
+        help
+            设备拿不到 WiFi 或连续多次连不上路由器时，开启 BLE 广播，由上位机通过
+            蓝牙写入 WiFi 名称/密码与上位机 IP/端口。连上 WiFi 后关闭蓝牙。
+
+            需要同时开启 Component config → Bluetooth → NimBLE（见 sdkconfig.defaults）。
+            未开启 NimBLE 时代码会退化为空实现，只是没有配网功能，不会编译失败。
+
+    config VW_PROV_NAME_PREFIX
+        string "蓝牙广播名前缀"
+        default "VoiceWake"
+        depends on VW_PROV_ENABLE
+        help
+            完整广播名为「前缀-WiFiMAC后三字节」，例如 VoiceWake-7B3C。
+            后缀用 WiFi MAC 是为了与 TCP 上报的 MAC 对得上。
+
+    config VW_PROV_TIMEOUT_S
+        int "配网窗口超时 (秒)"
+        default 300
+        depends on VW_PROV_ENABLE
+        help
+            进入配网后若一直没人连接/没有有效配置，超时退出并回到 WiFi 重连，
+            避免设备永久停在配网态。0 表示不超时。
+
+    config VW_STA_FAIL_THRESHOLD
+        int "WiFi 连续失败多少次进入配网"
+        default 5
+        range 1 50
+        help
+            有凭证但连不上时的容忍次数。凭证为空（出厂/刚擦过 NVS）时不受此限制，
+            直接进入配网。
+
     # ===== 出厂默认（NVS 为空时使用；正式 WiFi/IP 建议由上位机下发）=====
     config VW_DEFAULT_WIFI_SSID
         string "默认 WiFi SSID"

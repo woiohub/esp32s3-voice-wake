@@ -111,8 +111,8 @@ host/models/piper/zh_CN-huayan-medium.onnx.json
 
 1. 启动上位机，记下日志里的 `本机 IP`；
 2. 打开「设备」页，把该 IP 填进「上位机 IP」，端口默认 8888 → 点「下发配置」；
-3. 若设备还没配 WiFi：设备会起热点 `VoiceWake-XXXX`，连上后在「AP 配网」卡片填 SSID/密码下发。
-   两者都会让设备**重启生效**；
+3. 若设备还没配 WiFi：设备会**开启蓝牙广播 `VoiceWake-XXXX`**，在「蓝牙配网」卡片点「扫描」
+   选中设备，填好 WiFi 凭证与上位机地址后「写入设备并连接」。设备连上 WiFi 后会自动关闭蓝牙；
 4. 设备重启后顶部状态胶囊变绿，日志出现 `设备上线: {...}` 即可说唤醒词。
 
 > 端口两侧必须一致：`config.json → network.port` ↔ 固件 `CONFIG_VW_TCP_PORT`。
@@ -124,7 +124,7 @@ host/models/piper/zh_CN-huayan-medium.onnx.json
 | 页面 | 内容 |
 |---|---|
 | **会话** | 6 段阶段条（唤醒/录音/识别/大模型/合成/播报）+ 对话流 + 文本调试输入 + 就绪清单 |
-| **设备** | 连接卡（IP/MAC/信号/固件/唤醒词/音量）、AP 配网兜底、下位机参数（音量、唤醒开关、**唤醒回复词**、上位机 IP/端口） |
+| **设备** | 连接卡（IP/MAC/信号/固件/唤醒词/音量）、**蓝牙配网**（扫描→写入凭证与上位机地址）、下位机参数（音量、唤醒开关、**唤醒回复词**、上位机 IP/端口） |
 | **模型** | STT / LLM / TTS 三卡：字段校验、异步自检、测试大模型、试听、一键下载 |
 | **日志** | 级别/模块/关键字过滤、暂停、清空、导出、ERROR 染色、错误码说明（上限 5000 行） |
 
@@ -156,7 +156,7 @@ host/
 ├── models/                     # 模型目录（不入库）
 └── voice_assistant/
     ├── log.py  config.py  protocol.py  network.py  pipeline.py
-    ├── stt.py  llm.py  tts.py  model_download.py
+    ├── stt.py  llm.py  tts.py  model_download.py  provision.py
     └── gui/
         ├── theme.py  icons.py  bridge.py  tasks.py  main_window.py
         ├── pages/    # session / device / model / log

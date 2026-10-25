@@ -4,100 +4,130 @@
 #include "esp_netif.h"
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "esp_check.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <stdio.h>
 #include <string.h>
 
 #define TAG "comm:wifi"
-#define STA_RETRY_MAX 5   // 重试次数超过后进入 AP 配网模式
 
 static volatile bool s_sta_up = false;
-static volatile bool s_ap_mode = false;
-static int s_retry = 0;
+static volatile int s_retry = 0;
+static volatile bool s_inited = false;
+static volatile bool s_fail_notified = false;   /* 每轮只通知一次，避免反复进配网 */
+static bool s_has_cred = false;
 
-static void start_ap(void)
+static char s_ip[16];
+
+static wifi_fail_cb_t s_fail_cb;
+static void *s_fail_arg;
+
+static void notify_fail(void)
 {
-    if (s_ap_mode) {
-        return;
+    if (s_fail_cb && !s_fail_notified) {
+        s_fail_notified = true;
+        s_fail_cb(s_retry, s_fail_arg);
     }
-    uint8_t mac[6] = {0};
-    esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    char ssid[32];
-    snprintf(ssid, sizeof(ssid), "VoiceWake-%02X%02X%02X", mac[3], mac[4], mac[5]);
-
-    wifi_config_t ap_cfg = {0};
-    strlcpy((char *)ap_cfg.ap.ssid, ssid, sizeof(ap_cfg.ap.ssid));
-    ap_cfg.ap.ssid_len = strlen(ssid);
-    ap_cfg.ap.channel = 6;
-    ap_cfg.ap.max_connection = 2;
-
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
-    ESP_ERROR_CHECK(esp_wifi_start());
-    s_ap_mode = true;
-    ESP_LOGW(TAG, "STA 连接失败，已开启配网热点 SSID=%s", ssid);
 }
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
+    (void)arg;
+
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
-    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        s_sta_up = false;
-        if (s_retry++ < STA_RETRY_MAX) {
-            ESP_LOGI(TAG, "STA 断开，重连中 (%d/%d)", s_retry, STA_RETRY_MAX);
+        if (s_has_cred) {
             esp_wifi_connect();
         } else {
-            start_ap();
+            ESP_LOGW(TAG, "无 WiFi 凭证，等待蓝牙配网");
+        }
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        s_sta_up = false;
+        s_ip[0] = '\0';
+        s_retry++;
+
+        if (s_retry < CONFIG_VW_STA_FAIL_THRESHOLD) {
+            ESP_LOGI(TAG, "STA 断开，重连中 (%d/%d)",
+                     s_retry, CONFIG_VW_STA_FAIL_THRESHOLD);
+            esp_wifi_connect();
+        } else {
+            /* 达到阈值：只通知上层，不在事件上下文里做任何耗时动作 */
+            ESP_LOGW(TAG, "WiFi 连续失败 %d 次，请求进入配网", s_retry);
+            notify_fail();
         }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *evt = (ip_event_got_ip_t *)data;
         s_sta_up = true;
         s_retry = 0;
-        ip_event_got_ip_t *evt = (ip_event_got_ip_t *)data;
-        ESP_LOGI(TAG, "STA 已连接 IP=" IPSTR, IP2STR(&evt->ip_info.ip));
+        s_fail_notified = false;
+        snprintf(s_ip, sizeof(s_ip), IPSTR, IP2STR(&evt->ip_info.ip));
+        ESP_LOGI(TAG, "STA 已连接 IP=%s", s_ip);
 
         /* 语音链路对时延/抖动敏感：关闭 modem sleep（默认 WIFI_PS_MIN_MODEM 会在
          * 每个 DTIM 周期休眠，增加 20–100ms 抖动，并频繁触发 ADDBA/DELBA 重建）。
          * 本设备为市电供电，优先保证实时性。 */
-        ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+        esp_wifi_set_ps(WIFI_PS_NONE);
         ESP_LOGI(TAG, "省电模式已关闭 (WIFI_PS_NONE)，降低音频链路抖动");
     }
 }
 
-esp_err_t wifi_client_start(const char *ssid, const char *password)
+static esp_err_t wifi_hw_init(void)
 {
-    if (ssid == NULL || ssid[0] == '\0') {
-        ESP_LOGW(TAG, "未配置 WiFi 凭证，直接进入 AP 配网模式");
-        ESP_ERROR_CHECK(esp_netif_init());
-        ESP_ERROR_CHECK(esp_event_loop_create_default());
-        esp_netif_create_default_wifi_sta();
-        esp_netif_create_default_wifi_ap();
-        wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-        ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-        start_ap();
+    if (s_inited) {
         return ESP_OK;
     }
-
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    ESP_RETURN_ON_ERROR(esp_netif_init(), TAG, "netif init failed");
+    esp_err_t e = esp_event_loop_create_default();
+    if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "event loop create failed: %s", esp_err_to_name(e));
+        return e;
+    }
     esp_netif_create_default_wifi_sta();
-    esp_netif_create_default_wifi_ap();  // 预建 netif，供后续兜底切换
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_RETURN_ON_ERROR(esp_wifi_init(&cfg), TAG, "wifi init failed");
+    ESP_RETURN_ON_ERROR(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                                   wifi_event_handler, NULL),
+                        TAG, "reg wifi event failed");
+    ESP_RETURN_ON_ERROR(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                                   wifi_event_handler, NULL),
+                        TAG, "reg ip event failed");
+    s_inited = true;
+    return ESP_OK;
+}
 
-    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL));
+esp_err_t wifi_client_start(const char *ssid, const char *password)
+{
+    esp_err_t err = wifi_hw_init();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    s_has_cred = (ssid != NULL && ssid[0] != '\0');
 
     wifi_config_t sta_cfg = {0};
-    strlcpy((char *)sta_cfg.sta.ssid, ssid, sizeof(sta_cfg.sta.ssid));
-    strlcpy((char *)sta_cfg.sta.password, password, sizeof(sta_cfg.sta.password));
+    if (s_has_cred) {
+        strlcpy((char *)sta_cfg.sta.ssid, ssid, sizeof(sta_cfg.sta.ssid));
+        if (password != NULL) {
+            strlcpy((char *)sta_cfg.sta.password, password, sizeof(sta_cfg.sta.password));
+        }
+    }
     sta_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
 
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
-    ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "set mode failed");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg), TAG, "set cfg failed");
+    ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "wifi start failed");
 
+    if (!s_has_cred) {
+        ESP_LOGW(TAG, "未配置 WiFi 凭证，交由上层进入蓝牙配网");
+        return ESP_ERR_NOT_FOUND;
+    }
     return ESP_OK;
+}
+
+bool wifi_client_has_cred(void)
+{
+    return s_has_cred;
 }
 
 bool wifi_client_sta_connected(void)
@@ -105,9 +135,67 @@ bool wifi_client_sta_connected(void)
     return s_sta_up;
 }
 
-bool wifi_client_in_ap_mode(void)
+esp_err_t wifi_client_reconnect_with(const char *ssid, const char *password)
 {
-    return s_ap_mode;
+    if (ssid == NULL || ssid[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+    ESP_RETURN_ON_ERROR(wifi_hw_init(), TAG, "hw init failed");
+
+    wifi_config_t sta_cfg = {0};
+    strlcpy((char *)sta_cfg.sta.ssid, ssid, sizeof(sta_cfg.sta.ssid));
+    if (password != NULL) {
+        strlcpy((char *)sta_cfg.sta.password, password, sizeof(sta_cfg.sta.password));
+    }
+    sta_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+
+    s_retry = 0;
+    s_fail_notified = false;
+    s_sta_up = false;
+    s_ip[0] = '\0';
+    s_has_cred = true;
+
+    esp_wifi_disconnect();      /* 未连接时会返回错误，忽略即可 */
+    ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg), TAG, "set cfg failed");
+    return esp_wifi_connect();
+}
+
+bool wifi_client_wait_ip(uint32_t timeout_ms)
+{
+    uint32_t waited = 0;
+    while (waited < timeout_ms) {
+        if (s_sta_up) {
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+        waited += 100;
+    }
+    return s_sta_up;
+}
+
+esp_err_t wifi_client_ip(char *out, unsigned cap)
+{
+    if (out == NULL || cap == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    strlcpy(out, s_ip, cap);
+    return s_ip[0] ? ESP_OK : ESP_ERR_INVALID_STATE;
+}
+
+void wifi_client_retry_now(void)
+{
+    s_retry = 0;
+    s_fail_notified = false;
+    if (s_has_cred && s_inited) {
+        ESP_LOGI(TAG, "重置失败计数，重新尝试连接");
+        esp_wifi_connect();
+    }
+}
+
+void wifi_client_set_fail_cb(wifi_fail_cb_t cb, void *arg)
+{
+    s_fail_cb = cb;
+    s_fail_arg = arg;
 }
 
 int wifi_client_rssi(void)
@@ -116,7 +204,7 @@ int wifi_client_rssi(void)
     if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
         return ap.rssi;
     }
-    return 0;   // 未连接或正在切换，上层显示 "—"
+    return 0;   /* 未连接或正在切换，上层显示 "—" */
 }
 
 void wifi_client_mac(char *out, unsigned cap)
@@ -125,7 +213,8 @@ void wifi_client_mac(char *out, unsigned cap)
     if (out == NULL || cap < 18) {
         return;
     }
-    if (esp_wifi_get_mac(WIFI_IF_STA, mac) != ESP_OK) {
+    /* 用 efuse 出厂 MAC：与 WiFi STA MAC 相同，且不依赖 esp_wifi_init 是否已执行 */
+    if (esp_read_mac(mac, ESP_MAC_WIFI_STA) != ESP_OK) {
         out[0] = '\0';
         return;
     }

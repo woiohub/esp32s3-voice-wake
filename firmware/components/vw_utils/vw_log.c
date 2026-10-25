@@ -18,6 +18,9 @@ const char *vw_err_name(int code)
     case VW_ERR_WIFI_NOT_CONNECTED: return "WIFI_NOT_CONNECTED";
     case VW_ERR_NET_NOT_CONNECTED:  return "NET_NOT_CONNECTED";
     case VW_ERR_NET_SEND:           return "NET_SEND";
+    case VW_ERR_BLE_INIT:           return "BLE_INIT";
+    case VW_ERR_BLE_GAP:            return "BLE_GAP";
+    case VW_ERR_BLE_PROV_FAIL:      return "BLE_PROV_FAIL";
     case VW_ERR_SESSION_BUSY:       return "SESSION_BUSY";
     default:                       return "UNKNOWN";
     }

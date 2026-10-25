@@ -36,6 +36,9 @@ typedef enum {
     VW_ERR_WIFI_NOT_CONNECTED = 0x3001,
     VW_ERR_NET_NOT_CONNECTED  = 0x3002,
     VW_ERR_NET_SEND           = 0x3003,
+    VW_ERR_BLE_INIT           = 0x3004,   /* 蓝牙协议栈初始化失败 */
+    VW_ERR_BLE_GAP            = 0x3005,   /* 广播/连接相关 NimBLE 返回非 0 */
+    VW_ERR_BLE_PROV_FAIL      = 0x3006,   /* 配网写入了新凭证但连不上 WiFi */
     /* 业务层 0x40xx */
     VW_ERR_SESSION_BUSY       = 0x4001,
 } vw_err_t;

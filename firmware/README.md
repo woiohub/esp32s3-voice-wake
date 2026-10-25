@@ -3,6 +3,7 @@
 本地**离线**唤醒词检测 + 语音采集上传 + TTS 音频播放。
 
 - 唤醒在片内完成（esp-sr WakeNet），**不联网、不上传音频**
+- 连不上 WiFi 时自动开**蓝牙配网**，由上位机写入凭证；连上后自动关闭蓝牙
 - 唤醒后按 20ms 分帧把 PCM 上传给上位机
 - 接收上位机下发的 TTS PCM 并驱动功放播放，支持播报中打断（AEC）
 - 参数（音量/唤醒开关/回复词开关/WiFi/上位机地址）可由上位机下发并持久化到 NVS
@@ -91,7 +92,8 @@ firmware/
 │   ├── vw_audio/                   # I2S RX/TX + 线路自检（静止线/串扰）
 │   ├── vw_config/                  # NVS 持久化（namespace "vw"）
 │   ├── vw_wakeword/                # esp-sr AFE：WakeNet + AEC + VAD
-│   ├── vw_comm/                    # 帧协议 / TCP 客户端 / WiFi+AP 配网
+│   ├── vw_comm/                    # 帧协议 / TCP 客户端 / WiFi STA
+│   ├── vw_prov/                    # 蓝牙（BLE）配网：广播 + GATT 收凭证 + 状态推送
 │   └── vw_voice/                   # 会话状态机、控制命令、端点检测、打断
 ├── test/
 │   ├── mic_test/                   # 独立工程：麦克风验证（扫位宽×槽位）

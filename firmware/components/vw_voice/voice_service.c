@@ -5,6 +5,7 @@
 #include "net_client.h"
 #include "net_proto.h"
 #include "config_store.h"
+#include "ble_prov.h"
 #include "vw_log.h"
 #include "vw_version.h"
 
@@ -16,6 +17,7 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_check.h"
+#include "esp_heap_caps.h"
 #include "cJSON.h"
 #include <stdio.h>
 #include <string.h>
@@ -68,10 +70,20 @@ static int64_t g_last_offline_warn_ms = 0;     // “唤醒命中但未连上位
 static int64_t g_last_level_log_ms = 0;        // 麦克风电平提示限频
 static int64_t g_last_mic_bad_ms = 0;          // “麦克风数据无效”提示限频
 
+/* prov_ev_t 在下方定义，这里先用前置定义保证顺序 */
+typedef enum {
+    PROV_EV_ENTER = 1,
+    PROV_EV_CFG,
+} prov_ev_t;
+
 static inline int64_t now_ms(void)
 {
     return esp_timer_get_time() / 1000;
 }
+
+/* 前置声明：handle_control 在定义之前就要用到 */
+static void send_hello(void);
+static void prov_post(prov_ev_t ev);
 
 /* 音量软件缩放（MAX98357 无数字音量接口） */
 static inline int16_t apply_volume(int16_t s)
@@ -323,6 +335,20 @@ static void handle_control(const char *json, int len)
             config_store_save(&g_cfg);
             cJSON_AddBoolToObject(result, "ack_enable", g_cfg.ack_enable);
         }
+        cJSON *host = cJSON_GetObjectItem(params, "host");
+        if (cJSON_IsObject(host)) {
+            const char *ip = cJSON_GetStringValue(cJSON_GetObjectItem(host, "ip"));
+            cJSON *port = cJSON_GetObjectItem(host, "port");
+            if (ip && ip[0]) {
+                strlcpy(g_cfg.host_ip, ip, sizeof(g_cfg.host_ip));
+            }
+            if (cJSON_IsNumber(port) && port->valuedouble > 0 && port->valuedouble <= 65535) {
+                g_cfg.host_port = (uint16_t)port->valuedouble;
+            }
+            config_store_save(&g_cfg);
+            cJSON_AddStringToObject(result, "host_ip", g_cfg.host_ip);
+            cJSON_AddNumberToObject(result, "host_port", g_cfg.host_port);
+        }
     } else if (cmd && !strcmp(cmd, "volume.set")) {
         cJSON *vol = cJSON_GetObjectItem(params, "volume");
         if (cJSON_IsNumber(vol) && vol->valuedouble >= 0 && vol->valuedouble <= 100) {
@@ -333,6 +359,16 @@ static void handle_control(const char *json, int len)
         } else {
             code = 2002;
             error = "invalid volume";
+        }
+    } else if (cmd && !strcmp(cmd, "prov.start")) {
+        /* 上位机主动要求重新配网（已连上时想换 WiFi）：清空凭证语义上不安全，
+         * 这里只"打开配网窗口"，凭证在配网成功后才覆盖。 */
+        ESP_LOGW(TAG, "收到 prov.start，进入蓝牙配网");
+        if (ble_prov_active()) {
+            cJSON_AddBoolToObject(result, "prov", true);
+        } else {
+            prov_post(PROV_EV_ENTER);
+            cJSON_AddBoolToObject(result, "prov", true);
         }
     } else if (cmd && !strcmp(cmd, "wifi.set")) {
         cJSON *ssid = cJSON_GetObjectItem(params, "ssid");
@@ -373,7 +409,7 @@ static void handle_control(const char *json, int len)
         cJSON_AddStringToObject(result, "fw", VW_FW_VERSION);
         cJSON_AddNumberToObject(result, "volume", g_cfg.volume);
         cJSON_AddBoolToObject(result, "wifi", wifi_client_sta_connected());
-        cJSON_AddBoolToObject(result, "ap_mode", wifi_client_in_ap_mode());
+        cJSON_AddBoolToObject(result, "prov", ble_prov_active());   /* 蓝牙配网中 */
         cJSON_AddBoolToObject(result, "wake_enable", g_cfg.wake_enable);
         cJSON_AddBoolToObject(result, "ack_enable", g_cfg.ack_enable);
         cJSON_AddNumberToObject(result, "state", (int)g_state);
@@ -386,6 +422,15 @@ static void handle_control(const char *json, int len)
         result = NULL;
     }
 
+    /* 参数被改动后补发一次 hello：上位机设备页靠它刷新，不用再点「读取当前配置」 */
+    bool params_changed = (code == 0) &&
+                          cmd && (!strcmp(cmd, "config.set") ||
+                                  !strcmp(cmd, "volume.set") ||
+                                  !strcmp(cmd, "wakeword.set"));
+    if (params_changed) {
+        send_hello();
+    }
+
     reply_control(id, cmd ? cmd : "", code, result, error);
     if (need_reboot) {
         vTaskDelay(pdMS_TO_TICKS(500));  // 给 ACK 留出发送时间
@@ -393,22 +438,40 @@ static void handle_control(const char *json, int len)
     }
 }
 
+/**
+ * 上报设备信息（hello）。
+ *
+ * 连接建立时发一次；**参数变更后（音量/唤醒开关/回复词开关）再发一次**，
+ * 让上位机设备页立即反映实际值，而不是等用户点「读取当前配置」。
+ *
+ * 字段：device / fw / audio / mac / rssi / wakeword / volume / wake_enable / ack_enable
+ */
+static void send_hello(void)
+{
+    if (!net_client_connected()) {
+        return;
+    }
+    char mac[18] = {0};
+    wifi_client_mac(mac, sizeof(mac));
+    const char *wn = wakeword_model_name();
+    char json[384];
+    snprintf(json, sizeof(json),
+             "{\"cmd\":\"hello\",\"params\":{\"device\":\"esp32s3\",\"fw\":\"" VW_FW_VERSION "\","
+             "\"audio\":{\"rate\":%d,\"bits\":16,\"ch\":1},"
+             "\"mac\":\"%s\",\"rssi\":%d,\"wakeword\":\"%s\",\"volume\":%d,"
+             "\"wake_enable\":%s,\"ack_enable\":%s}}",
+             CONFIG_VW_SAMPLE_RATE, mac, wifi_client_rssi(),
+             wn ? wn : "", (int)g_cfg.volume,
+             g_cfg.wake_enable ? "true" : "false",
+             g_cfg.ack_enable ? "true" : "false");
+    net_client_send_control(json);
+}
+
 static void on_conn_change(bool connected)
 {
     ESP_LOGI(TAG, "host %s", connected ? "connected" : "disconnected");
     if (connected) {
-        // 带上 MAC / RSSI / 唤醒词 / 音量：上位机设备页直接显示，不用再单独查询
-        char mac[18] = {0};
-        wifi_client_mac(mac, sizeof(mac));
-        const char *wn = wakeword_model_name();
-        char json[320];
-        snprintf(json, sizeof(json),
-                 "{\"cmd\":\"hello\",\"params\":{\"device\":\"esp32s3\",\"fw\":\"" VW_FW_VERSION "\","
-                 "\"audio\":{\"rate\":%d,\"bits\":16,\"ch\":1},"
-                 "\"mac\":\"%s\",\"rssi\":%d,\"wakeword\":\"%s\",\"volume\":%d}}",
-                 CONFIG_VW_SAMPLE_RATE, mac, wifi_client_rssi(),
-                 wn ? wn : "", (int)g_cfg.volume);
-        net_client_send_control(json);
+        send_hello();
         if (g_state != APP_IDLE) {
             g_state = APP_IDLE;  // 断线重连后复位状态
         }
@@ -546,6 +609,161 @@ static void audio_task(void *arg)
     }
 }
 
+/* ================= 蓝牙配网 ================= */
+/*
+ * 触发条件（与需求一致）：
+ *   1) 凭证为空            → 立即进入
+ *   2) 有凭证但连续失败 5 次 → 进入（次数见 CONFIG_VW_STA_FAIL_THRESHOLD）
+ * 退出条件：
+ *   - 配网成功 → 关闭蓝牙 → 重启（让新的 host_ip/port 生效）
+ *   - 超时（CONFIG_VW_PROV_TIMEOUT_S）→ 关闭蓝牙 → 回到 WiFi 重连
+ */
+#if CONFIG_VW_PROV_ENABLE
+
+typedef struct {
+    prov_ev_t ev;
+    ble_prov_cfg_t cfg;
+} prov_msg_t;
+
+static QueueHandle_t g_prov_q;
+static int64_t g_prov_deadline;     /* 配网截止时间(ms)，0 表示不在配网中 */
+
+static void prov_post(prov_ev_t ev)
+{
+    if (g_prov_q == NULL) {
+        return;
+    }
+    prov_msg_t m = {0};
+    m.ev = ev;
+    xQueueSend(g_prov_q, &m, 0);
+}
+
+/* WiFi 连续失败回调：运行在 WiFi 事件上下文，**只能入队** */
+static void on_wifi_fail(int fails, void *arg)
+{
+    (void)arg;
+    ESP_LOGW(TAG, "WiFi 连续失败 %d 次 → 请求进入蓝牙配网", fails);
+    prov_post(PROV_EV_ENTER);
+}
+
+/* BLE 收到配置回调：运行在 BLE host 任务，**只能入队** */
+static void on_prov_cfg(const ble_prov_cfg_t *cfg, void *arg)
+{
+    (void)arg;
+    if (g_prov_q == NULL) {
+        return;
+    }
+    prov_msg_t m = {0};
+    m.ev = PROV_EV_CFG;
+    m.cfg = *cfg;
+    if (xQueueSend(g_prov_q, &m, 0) != pdTRUE) {
+        VW_LOG_W(TAG, "配网队列已满，丢弃本次配置");
+    }
+}
+
+static void prov_enter(void)
+{
+    if (ble_prov_active()) {
+        return;
+    }
+    unsigned before = (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    if (ble_prov_start() != ESP_OK) {   /* 内部会按需初始化蓝牙 */
+        VW_LOG_E(TAG, VW_ERR_BLE_INIT, "无法开启蓝牙配网（蓝牙未编译或初始化失败）");
+        return;
+    }
+    if (g_state != APP_IDLE) {
+        g_state = APP_IDLE;         /* 配网期间不采集不播放 */
+    }
+    g_prov_deadline = (CONFIG_VW_PROV_TIMEOUT_S > 0)
+                      ? now_ms() + (int64_t)CONFIG_VW_PROV_TIMEOUT_S * 1000
+                      : 0;
+    ESP_LOGI(TAG, "蓝牙初始化占用内部 RAM %u KB（剩余 %u KB）",
+             (before - (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL)) / 1024,
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
+}
+
+/* 返回 true 表示已连上 WiFi（随后会重启） */
+static bool prov_apply(const ble_prov_cfg_t *c)
+{
+    ble_prov_notify_state("connecting", NULL, NULL);
+
+    /* 先落盘：即使这次连接失败，用户重试时也不用重新输一遍 */
+    strlcpy(g_cfg.wifi_ssid, c->ssid, sizeof(g_cfg.wifi_ssid));
+    strlcpy(g_cfg.wifi_pass, c->password, sizeof(g_cfg.wifi_pass));
+    if (c->host_ip[0]) {
+        strlcpy(g_cfg.host_ip, c->host_ip, sizeof(g_cfg.host_ip));
+    }
+    if (c->host_port) {
+        g_cfg.host_port = c->host_port;
+    }
+    config_store_save(&g_cfg);
+
+    if (wifi_client_reconnect_with(c->ssid, c->password) != ESP_OK) {
+        ble_prov_notify_state("fail", "wifi config rejected", NULL);
+        return false;
+    }
+    if (!wifi_client_wait_ip(15000)) {
+        VW_LOG_E(TAG, VW_ERR_BLE_PROV_FAIL, "配网后仍连不上 WiFi（ssid=%s）", c->ssid);
+        ble_prov_notify_state("fail", "cannot join WiFi (password or signal)", NULL);
+        return false;               /* 保持蓝牙，让用户改密码重试 */
+    }
+
+    char ip[16] = {0};
+    wifi_client_ip(ip, sizeof(ip));
+    ESP_LOGI(TAG, "配网成功：IP=%s，上位机 %s:%u", ip, g_cfg.host_ip,
+             (unsigned)g_cfg.host_port);
+    ble_prov_notify_state("ok", NULL, ip);
+    return true;
+}
+
+static void prov_task(void *arg)
+{
+    (void)arg;
+    prov_msg_t msg;
+
+    for (;;) {
+        TickType_t wait = portMAX_DELAY;
+        if (ble_prov_active() && g_prov_deadline > 0) {
+            int64_t left = g_prov_deadline - now_ms();
+            wait = pdMS_TO_TICKS(left > 0 ? left : 1);
+        }
+
+        if (xQueueReceive(g_prov_q, &msg, wait) == pdTRUE) {
+            if (msg.ev == PROV_EV_ENTER) {
+                prov_enter();
+            } else if (msg.ev == PROV_EV_CFG) {
+                if (prov_apply(&msg.cfg)) {
+                    /* 关键顺序：先关蓝牙（射频静默），留时间把 ok 发出去，再重启 */
+                    ble_prov_stop();
+                    g_prov_deadline = 0;
+                    vTaskDelay(pdMS_TO_TICKS(800));
+                    esp_restart();
+                } else {
+                    /* 失败：蓝牙继续开着，用户可重新写入 */
+                    if (g_prov_deadline == 0) {
+                        g_prov_deadline = now_ms() +
+                                          (int64_t)CONFIG_VW_PROV_TIMEOUT_S * 1000;
+                    }
+                }
+            }
+        } else if (ble_prov_active()) {
+            /* 超时：退出配网并归还蓝牙内存，回 WiFi 重连，避免永久卡在配网态 */
+            ESP_LOGW(TAG, "配网超时（%d 秒无有效配置），退出配网并重试 WiFi",
+                     CONFIG_VW_PROV_TIMEOUT_S);
+            ble_prov_stop();
+            ble_prov_deinit();      /* 把 ~50KB 内部 RAM 还给语音链路 */
+            g_prov_deadline = 0;
+            wifi_client_retry_now();
+        }
+    }
+}
+
+#else   /* 未启用蓝牙配网 */
+
+static void prov_post(prov_ev_t ev) { (void)ev; }
+
+#endif  /* CONFIG_VW_PROV_ENABLE */
+
 /* ================= 服务初始化 ================= */
 
 esp_err_t voice_service_init(void)
@@ -565,17 +783,51 @@ esp_err_t voice_service_init(void)
     }
     wakeword_set_enabled(g_cfg.wake_enable);
 
-    ESP_RETURN_ON_ERROR(wifi_client_start(g_cfg.wifi_ssid, g_cfg.wifi_pass), TAG, "wifi start failed");
+    /* 配网：先建队列与任务，再启动 WiFi —— 无凭证时 WiFi 会立刻要求进配网。
+     * 注意：**蓝牙在这里不初始化**（NimBLE 要占 40~60KB 内部 RAM，会把
+     * playback/audio 的任务栈挤到创建失败，v0.8.0 实测过），
+     * 改为进入配网时按需初始化，配网结束 ble_prov_deinit() 归还内存。 */
+#if CONFIG_VW_PROV_ENABLE
+    g_prov_q = xQueueCreate(4, sizeof(prov_msg_t));
+    if (g_prov_q == NULL) {
+        VW_LOG_E(TAG, VW_ERR_NOMEM, "create prov queue failed");
+        return ESP_FAIL;
+    }
+    if (xTaskCreate(prov_task, "prov", 6144, NULL, 8, NULL) != pdPASS) {
+        VW_LOG_E(TAG, VW_ERR_NOMEM, "create prov task failed");
+        return ESP_FAIL;
+    }
+    ble_prov_set_apply_cb(on_prov_cfg, NULL);
+    wifi_client_set_fail_cb(on_wifi_fail, NULL);
+#endif
+
+    esp_err_t werr = wifi_client_start(g_cfg.wifi_ssid, g_cfg.wifi_pass);
+    if (werr == ESP_ERR_NOT_FOUND) {
+        ESP_LOGW(TAG, "设备尚无 WiFi 凭证 → 立即进入蓝牙配网");
+        prov_post(PROV_EV_ENTER);
+    } else if (werr != ESP_OK) {
+        VW_LOG_E(TAG, VW_ERR_WIFI_NOT_CONNECTED, "wifi start failed: %s",
+                 esp_err_to_name(werr));
+        return werr;
+    }
+
     net_client_set_handlers(handle_control, on_audio_down, on_conn_change);
     ESP_RETURN_ON_ERROR(net_client_start(g_cfg.host_ip, g_cfg.host_port), TAG, "net start failed");
 
-    if (xTaskCreate(audio_task, "audio", 8192, NULL, 11, NULL) != pdPASS) {
-        VW_LOG_E(TAG, VW_ERR_NOMEM, "create audio task failed");
-        return ESP_FAIL;
-    }
+    /* 先创建 playback（内部 RAM 最紧张的时刻在最后），
+     * 失败时的报错才有意义；audio 最后创建，创建成功即开始采集。 */
     if (xTaskCreate(playback_task, "playback", 4096, NULL, 12, NULL) != pdPASS) {
-        VW_LOG_E(TAG, VW_ERR_NOMEM, "create playback task failed");
+        VW_LOG_E(TAG, VW_ERR_NOMEM, "create playback task failed（内部 RAM 不足，"
+                 "free_internal=%u）",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
         return ESP_FAIL;
     }
+    if (xTaskCreate(audio_task, "audio", 8192, NULL, 11, NULL) != pdPASS) {
+        VW_LOG_E(TAG, VW_ERR_NOMEM, "create audio task failed（free_internal=%u）",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "全部任务就绪，内部 RAM 剩余 %u KB",
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
     return ESP_OK;
 }
